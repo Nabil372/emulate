@@ -1133,11 +1133,13 @@ export function authRoutes(ctx: RouteContext): void {
           throw new OauthApiError(400, 'invalid_grant', 'Refresh token has expired.');
         }
         // Revoking a session or logging out deletes its row, which a refresh of any of the
-        // session's tokens must then fail like an unknown token. Sweeping both the presented
-        // token and the live one it resolved to keeps a revoked session's chain from lingering.
+        // session's tokens must then fail like an unknown token. Every token the session still
+        // has goes with it — a replay's retired links included — since no rotation will ever
+        // sweep a session that cannot refresh again.
         if (!ws.sessions.get(refreshToken.session_id)) {
-          ws.refreshTokens.delete(presented.id);
-          ws.refreshTokens.delete(refreshToken.id);
+          for (const orphan of ws.refreshTokens.findBy('session_id', refreshToken.session_id)) {
+            ws.refreshTokens.delete(orphan.id);
+          }
           throw new OauthApiError(400, 'invalid_grant', 'Invalid refresh token.');
         }
 
@@ -1511,6 +1513,12 @@ export function authRoutes(ctx: RouteContext): void {
         exchanged_at: null,
         exchanged_for_id: null,
       });
+    // A replay that also carries an explicit organization_id switches organization the way a
+    // rotation would. The token handed back has to agree with the organization this response
+    // reports, or the next plain refresh of it would silently switch back.
+    if (replayedRefreshToken && replayedRefreshToken.organization_id !== organizationId) {
+      ws.refreshTokens.update(replayedRefreshToken.id, { organization_id: organizationId });
+    }
     // Retire the token a rotation consumed, pointing it at its successor. Done only now, after
     // every check that could still fail the grant, so a refresh that fails leaves the token
     // live for the client to retry.
