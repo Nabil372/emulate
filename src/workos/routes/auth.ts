@@ -1519,6 +1519,16 @@ export function authRoutes(ctx: RouteContext): void {
         exchanged_at: new Date().toISOString(),
         exchanged_for_id: newRefreshToken.id,
       });
+      // Sweep this session's retired tokens whose grace window has closed, since a replay is
+      // the only other thing that ever touches one and a client that kept up never sends it
+      // again — without this every rotation would leave a row behind for good. Safe for chain
+      // walks: anything older in the chain than a swept token was exchanged earlier still, so
+      // it is past its own window and would be rejected before the walk.
+      for (const retired of ws.refreshTokens.findBy('session_id', session.id)) {
+        if (retired.exchanged_at !== null && !withinReplayGrace(retired.exchanged_at)) {
+          ws.refreshTokens.delete(retired.id);
+        }
+      }
     }
 
     // Emit authentication event (hybrid Option B for action-specific events)

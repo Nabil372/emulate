@@ -550,6 +550,16 @@ describe('Auth routes', () => {
     const replayB = await refresh(tokenB);
     expect(replayB.status).toBe(200);
     expect((await json(replayB)).refresh_token).toBe(tokenC);
+
+    // Once their grace windows close, the next rotation sweeps the retired links rather than
+    // leaving a row behind per refresh; only the token just retired and its successor remain.
+    setSystemTime(new Date(Date.now() + 31_000));
+    const { refresh_token: tokenD } = await json(await refresh(tokenC));
+    const remaining = getWorkOSStore(store)
+      .refreshTokens.all()
+      .map((t) => t.token)
+      .sort();
+    expect(remaining).toEqual([tokenC, tokenD].sort());
   });
 
   it('a replay for a revoked session fails like any refresh of that session', async () => {
