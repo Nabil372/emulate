@@ -115,7 +115,7 @@ export const FEATURES: FeatureDef[] = [
     name: 'Authentication',
     tags: ['user-management.authentication', 'user-management.magic-auth'],
     notes:
-      'All grant types are hand-written rather than generated from the spec. Refresh tokens always rotate, which is stricter than production.',
+      'All grant types are hand-written rather than generated from the spec. Refresh tokens rotate on every exchange, with the documented 30-second replay grace period.',
   },
   {
     name: 'Organization Memberships',

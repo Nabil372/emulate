@@ -8,7 +8,7 @@ import {
   generateId,
   generateUlid,
 } from '../../core/index.js';
-import { getWorkOSStore } from '../store.js';
+import { getWorkOSStore, type WorkOSStore } from '../store.js';
 import { resolvePrimaryRole, getRolePermissions } from '../role-helpers.js';
 import { tokenFeatureFlags } from './feature-flags.js';
 import {
@@ -31,7 +31,7 @@ import {
 } from '../helpers.js';
 import { renderConfiguredJwtTemplate } from '../jwt-template.js';
 import type { EventBus } from '../event-bus.js';
-import type { WorkOSInvitation, WorkOSSSOAuthorization, WorkOSUser } from '../entities.js';
+import type { WorkOSInvitation, WorkOSRefreshToken, WorkOSSSOAuthorization, WorkOSUser } from '../entities.js';
 import { STORE_KEYS, STORE_KEY_PREFIXES } from '../constants.js';
 import {
   renderLoginPage,
@@ -81,6 +81,44 @@ const INVITATION_TOKEN_GRANTS = new Set([
   'urn:workos:oauth:grant-type:magic-auth',
   'urn:workos:oauth:grant-type:magic-auth:code',
 ]);
+
+/**
+ * How long a just-exchanged refresh token keeps answering with the tokens its exchange minted.
+ *
+ * Rotation on its own races: two concurrent requests that both notice an expired access token,
+ * or a client retrying after a slow network, would present the same refresh token twice and the
+ * second would fail because the first already rotated it. The public docs
+ * (https://workos.com/docs/authkit/session-resilience, "The replay grace period") describe the
+ * fix: "AuthKit applies a short grace period after a refresh token is exchanged. Within that
+ * period, replaying the just-exchanged token returns the same rotated tokens as the first
+ * exchange rather than an error. This means concurrent refreshes and network retries converge
+ * on one result instead of tearing down the session. The grace period is 30 seconds." And once
+ * it elapses: "the old token is terminally invalid. A replay after that point returns an
+ * `invalid_grant` error and the session must re-authenticate."
+ */
+const REFRESH_TOKEN_REPLAY_GRACE_MS = 30 * 1000;
+
+/**
+ * Whether a retired refresh token is still inside its replay grace period. Measured from the
+ * token's own exchange, so each link in a rotation chain gets its own window.
+ */
+function withinReplayGrace(exchangedAt: string, now = Date.now()): boolean {
+  return now - new Date(exchangedAt).getTime() <= REFRESH_TOKEN_REPLAY_GRACE_MS;
+}
+
+/**
+ * Follow a retired token's `exchanged_for_id` links to the live token at the end of its rotation
+ * chain: the token every replay converges on, so a client two rotations behind still ends up
+ * holding the same credentials as one that kept up. Undefined when a link is missing, which
+ * happens once the chain's live token has been expired or its session revoked and swept.
+ */
+function liveRefreshTokenInChain(ws: WorkOSStore, retired: WorkOSRefreshToken): WorkOSRefreshToken | undefined {
+  let current: WorkOSRefreshToken | undefined = retired;
+  while (current && current.exchanged_for_id !== null) {
+    current = ws.refreshTokens.get(current.exchanged_for_id);
+  }
+  return current;
+}
 
 interface AuthorizeParams {
   redirectUri: string;
@@ -793,6 +831,12 @@ export function authRoutes(ctx: RouteContext): void {
     // authentications leave this true; refresh_token flips it off and sets refreshSessionId.
     let isFreshLogin = true;
     let refreshSessionId: string | null = null;
+    // The live token a refresh_token grant is rotating out, retired (not deleted) once its
+    // successor is minted so a replay inside the grace period can converge on that successor.
+    let exchangedRefreshToken: WorkOSRefreshToken | undefined;
+    // The live token a replayed refresh_token grant resolved to. Set, the response hands this
+    // token back instead of minting another, so every replay converges on one rotation.
+    let replayedRefreshToken: WorkOSRefreshToken | undefined;
     // The client_id bound to the originating grant (auth code or refresh token). Falls back
     // to the request's client_id when the grant carries none: direct grants (password, magic
     // auth) have no originating authorization, and codes minted by a client-less /authorize —
@@ -1063,13 +1107,38 @@ export function authRoutes(ctx: RouteContext): void {
           throw new OauthApiError(400, 'invalid_request', 'refresh_token is required.');
         }
 
-        const refreshToken = ws.refreshTokens.findOneBy('token', token);
-        if (!refreshToken) {
+        const presented = ws.refreshTokens.findOneBy('token', token);
+        if (!presented) {
           throw new OauthApiError(400, 'invalid_grant', 'Invalid refresh token.');
         }
+
+        // A retired token is replayed, not re-rotated: inside its grace period it resolves to
+        // the live token its exchange led to, and the response hands that same token back with
+        // a fresh access token (see REFRESH_TOKEN_REPLAY_GRACE_MS). Past the grace period, or
+        // once the chain it led to is gone, it is terminally invalid — swept here, since nothing
+        // else will ever encounter it.
+        let refreshToken = presented;
+        if (presented.exchanged_at !== null) {
+          const live = withinReplayGrace(presented.exchanged_at) ? liveRefreshTokenInChain(ws, presented) : undefined;
+          if (!live) {
+            ws.refreshTokens.delete(presented.id);
+            throw new OauthApiError(400, 'invalid_grant', 'Invalid refresh token.');
+          }
+          refreshToken = live;
+          replayedRefreshToken = live;
+        }
+
         if (isExpired(refreshToken.expires_at)) {
           ws.refreshTokens.delete(refreshToken.id);
           throw new OauthApiError(400, 'invalid_grant', 'Refresh token has expired.');
+        }
+        // Revoking a session or logging out deletes its row, which a refresh of any of the
+        // session's tokens must then fail like an unknown token. Sweeping both the presented
+        // token and the live one it resolved to keeps a revoked session's chain from lingering.
+        if (!ws.sessions.get(refreshToken.session_id)) {
+          ws.refreshTokens.delete(presented.id);
+          ws.refreshTokens.delete(refreshToken.id);
+          throw new OauthApiError(400, 'invalid_grant', 'Invalid refresh token.');
         }
 
         user = ws.users.get(refreshToken.user_id);
@@ -1081,12 +1150,13 @@ export function authRoutes(ctx: RouteContext): void {
         // Allow body.organization_id to switch org context (switchToOrganization)
         organizationId = (body.organization_id as string) ?? refreshToken.organization_id;
 
-        // Rotate within the existing session: capture it for reuse, delete the old token,
-        // and issue a new one below — no new session, no authentication event.
+        // Rotate within the existing session: capture it for reuse and issue a new token below —
+        // no new session, no authentication event. The presented token is retired, not deleted,
+        // once its successor exists, so a replay inside the grace period can find that successor.
         refreshSessionId = refreshToken.session_id;
         // Carry the original client_id forward across refresh rotations.
         grantClientId = refreshToken.client_id ?? undefined;
-        ws.refreshTokens.delete(refreshToken.id);
+        if (!replayedRefreshToken) exchangedRefreshToken = refreshToken;
         authMethod = 'OAuth';
         isFreshLogin = false;
         break;
@@ -1427,15 +1497,29 @@ export function authRoutes(ctx: RouteContext): void {
       { claims: templateClaims, issuerClientId: tokenClientId },
     );
 
-    // Store a real refresh token
-    const newRefreshToken = ws.refreshTokens.insert({
-      token: generateId('ref'),
-      user_id: user.id,
-      organization_id: organizationId,
-      session_id: session.id,
-      expires_at: expiresIn(30 * 24 * 60), // 30 days
-      client_id: tokenClientId ?? null,
-    });
+    // Store a real refresh token — unless this is a replay inside the grace period, which hands
+    // back the token the original exchange minted so concurrent refreshes converge on one result.
+    const newRefreshToken =
+      replayedRefreshToken ??
+      ws.refreshTokens.insert({
+        token: generateId('ref'),
+        user_id: user.id,
+        organization_id: organizationId,
+        session_id: session.id,
+        expires_at: expiresIn(30 * 24 * 60), // 30 days
+        client_id: tokenClientId ?? null,
+        exchanged_at: null,
+        exchanged_for_id: null,
+      });
+    // Retire the token a rotation consumed, pointing it at its successor. Done only now, after
+    // every check that could still fail the grant, so a refresh that fails leaves the token
+    // live for the client to retry.
+    if (exchangedRefreshToken) {
+      ws.refreshTokens.update(exchangedRefreshToken.id, {
+        exchanged_at: new Date().toISOString(),
+        exchanged_for_id: newRefreshToken.id,
+      });
+    }
 
     // Emit authentication event (hybrid Option B for action-specific events)
     if (isFreshLogin) {

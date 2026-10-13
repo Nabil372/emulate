@@ -321,6 +321,14 @@ export interface WorkOSRefreshToken extends Entity {
   expires_at: string;
   /** The client_id the original access token was minted for, carried forward across refresh rotations. */
   client_id: string | null;
+  /**
+   * When this token was exchanged for its successor; null while it is the live token. A retired
+   * token stays stored through the replay grace period so a concurrent or retried refresh can
+   * converge on the same rotation instead of failing. Internal bookkeeping, never serialized.
+   */
+  exchanged_at: string | null;
+  /** The id of the token the exchange minted; null while this token is the live one. */
+  exchanged_for_id: string | null;
 }
 
 export interface WorkOSAuthenticationChallenge extends Entity {
