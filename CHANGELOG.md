@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/workos/emulate/compare/v0.14.0...v0.14.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **memberships:** honor the plain statuses param and default to active ([#135](https://github.com/workos/emulate/issues/135)) ([34fdbad](https://github.com/workos/emulate/commit/34fdbaded104d37536dd20d22e2981af3d98b3b0))
+
 ## [0.14.0](https://github.com/workos/emulate/compare/v0.13.1...v0.14.0) (2026-09-22)
 
 
