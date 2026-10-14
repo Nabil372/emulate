@@ -124,7 +124,12 @@ describe('MCP client against the AuthKit OAuth server', () => {
     });
     expect(tokenResponse.status).toBe(200);
     const tokens = (await tokenResponse.json()) as Record<string, any>;
-    expect(tokens).toMatchObject({ token_type: 'Bearer', expires_in: 3600, scope: 'openid profile offline_access' });
+    // Production's code-exchange field set: lowercase `bearer`, an `id_token`, no `scope`.
+    expect(tokens).toMatchObject({ token_type: 'bearer', expires_in: 3600 });
+    expect(tokens.id_token.split('.')).toHaveLength(3);
+    expect(tokens).not.toHaveProperty('scope');
+    // `offline_access` was granted, so a refresh token comes with it.
+    expect(tokens.refresh_token).toMatch(/^ref_/);
 
     // 5. Verify against the JWKS discovery named.
     const jwks = (await (await fetch(metadata.jwks_uri)).json()) as Jwks;

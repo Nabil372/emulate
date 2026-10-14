@@ -57,7 +57,7 @@ describe('OAuth M2M token routes', () => {
     });
     expect(res.status).toBe(200);
     const body = await json(res);
-    expect(body.token_type).toBe('Bearer');
+    expect(body.token_type).toBe('bearer');
     expect(body.expires_in).toBe(3600);
     expect(body.scope).toBe('invoices:read invoices:write');
 
@@ -337,7 +337,7 @@ describe('OAuth M2M token routes', () => {
       client_secret: 'secret_malformed',
     });
     expect(noScope.status).toBe(200);
-    expect((await json(noScope)).scope).toBe('');
+    expect(await json(noScope)).not.toHaveProperty('scope');
 
     // A scope must not be accepted by substring-matching the stored string.
     const scoped = await form({
@@ -385,10 +385,18 @@ describe('OAuth token endpoint client errors', () => {
     await expectInvalidClient(await post({}), 'Missing authorization header.');
   });
 
-  it('answers a known client that presents no secret the same way', async () => {
+  it('answers a known confidential client that presents no secret with Missing client_secret', async () => {
+    // Production's ApplicationCredentialsOrPublicClientGuard, for a client that is not public.
     await expectInvalidClient(
       await post({ grant_type: 'client_credentials', client_id: 'client_billing' }),
-      'Missing authorization header.',
+      'Missing client_secret.',
+    );
+  });
+
+  it('answers a wrong secret with Application not found, as the credentials lookup does', async () => {
+    await expectInvalidClient(
+      await post({ grant_type: 'client_credentials', client_id: 'client_billing', client_secret: 'secret_wrong' }),
+      'Application not found.',
     );
   });
 
@@ -422,6 +430,7 @@ describe('OAuth token endpoint client errors', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          client_name: 'Test client',
           redirect_uris: ['http://localhost:3000/cb'],
           token_endpoint_auth_method: 'none',
         }),
@@ -452,7 +461,7 @@ describe('OAuth token endpoint client errors', () => {
         headers,
         body: new URLSearchParams(body).toString(),
       });
-      await expectInvalidClient(res, 'This client is registered for none.');
+      await expectInvalidClient(res, 'Unsupported client_secret.');
     });
   }
 

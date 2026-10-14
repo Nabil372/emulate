@@ -234,7 +234,7 @@ export const FEATURES: FeatureDef[] = [
     tags: ['user-management.redirect-uris', 'user-management.cors-origins', 'user-management.authkit-oauth-resources'],
     seedKeys: ['resourceIndicators'],
     notes:
-      'Redirect URIs are accepted but not enforced against authorize requests. MCP resource indicators (RFC 8707) are stored and, when a request names a registered one, become the `aud` of tokens from `/oauth2/token`; wildcard patterns are refused, and the resource flagged `default` is not used as a fallback audience.',
+      'Redirect URIs are accepted but not enforced against authorize requests. MCP resource indicators (RFC 8707) are stored and, when a request names a registered one, become the `aud` of tokens from `/oauth2/token`; once any is registered, a dynamically registered client naming an unregistered one at `/oauth2/authorize` is answered `invalid_target`, and one naming none is bound to the resource flagged `default`. Wildcard patterns are refused.',
   },
   {
     name: 'Admin Portal',

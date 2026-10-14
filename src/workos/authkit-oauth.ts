@@ -18,6 +18,9 @@ export const AUTHKIT_CODE_CHALLENGE_METHODS = ['S256'] as const;
 /** `none` is a public client, which `/oauth2/register` maps to a PKCE-only application. */
 export const AUTHKIT_TOKEN_ENDPOINT_AUTH_METHODS = ['none', 'client_secret_post', 'client_secret_basic'] as const;
 
+/** RFC 7591 `application_type`, the two values production's registration accepts. */
+export const AUTHKIT_APPLICATION_TYPES = ['web', 'native'] as const;
+
 /**
  * Whether the application is a public client: one that cannot keep a secret, so PKCE is its only
  * proof. `uses_pkce` is the field WorkOS gives an application for exactly this, and
@@ -65,16 +68,76 @@ export function isValidResourceUri(value: string): boolean {
 }
 
 /**
- * The `aud` for a token bound to `resource`. It is the resource only when the environment has
- * registered it as an indicator; anything else, including no resource at all, falls back to the
- * application's `audience` and then its `client_id`, which is what this surface minted before
- * indicators existed.
+ * The `aud` for a token bound to `resource`. A bound resource is always one the environment has
+ * registered (see `resolveAuthorizeResource` and the token endpoint's binding); with none, the
+ * audience falls back to the application's `audience` and then its `client_id`, which is what this
+ * surface minted before indicators existed.
  */
-export function resolveAudience(
+export function resolveAudience(application: WorkOSConnectApplication, resource: string | null): string {
+  return resource ?? application.audience ?? application.client_id;
+}
+
+export type AuthorizeResourceResult =
+  | { ok: true; resource: string | null }
+  | { ok: false; description: string | undefined };
+
+/**
+ * The RFC 8707 `resource` of an `/oauth2/authorize` request, resolved the way production's
+ * authorize handler does it (`validateResource` and the default-resource fallback that follows it):
+ *
+ * - A dynamically registered client's `resource` is validated only once the environment has
+ *   registered resources. Then a malformed or fragment-bearing value, or one matching no registered
+ *   resource, is `invalid_target` on the callback, with a description only for the malformed case.
+ *   With no resources registered the parameter is ignored, for backwards compatibility.
+ * - Any other client's `resource` is ignored: production gates resource indicators for those
+ *   behind an environment feature flag, so the flag-off path is the one reproduced.
+ * - A dynamically registered client that ends up bound to nothing (it omitted `resource`, or
+ *   nothing is registered) is bound to the resource flagged `default`, when one exists, so its
+ *   tokens still carry a resource audience. Some MCP clients omit the parameter entirely.
+ *
+ * Wildcard patterns are refused at registration here, so matching is exact.
+ */
+export function resolveAuthorizeResource(
   ws: WorkOSStore,
   application: WorkOSConnectApplication,
-  resource: string | null | undefined,
-): string {
-  if (resource && ws.authkitOauthResources.findOneBy('uri', resource)) return resource;
-  return application.audience ?? application.client_id;
+  resource: string | null,
+): AuthorizeResourceResult {
+  if (!application.was_dynamically_registered) return { ok: true, resource: null };
+  const registered = ws.authkitOauthResources.all();
+  let bound: string | null = null;
+  if (resource !== null && registered.length > 0) {
+    if (!isValidResourceUri(resource)) {
+      let parses = true;
+      try {
+        new URL(resource);
+      } catch {
+        parses = false;
+      }
+      return {
+        ok: false,
+        description: parses
+          ? 'Invalid target: resource URIs cannot contain a URL fragment.'
+          : 'Invalid target: resource URI is malformed.',
+      };
+    }
+    const match = registered.find((r) => r.uri === resource);
+    if (!match) return { ok: false, description: undefined };
+    bound = match.uri;
+  }
+  if (bound === null) bound = registered.find((r) => r.default)?.uri ?? null;
+  return { ok: true, resource: bound };
+}
+
+/**
+ * Whether a code exchange is answered with a refresh token, as production decides it
+ * (`shouldIssueRefreshToken` in the application consent tokens service): always when the grant
+ * carries `offline_access`; otherwise a dynamically registered client, which today means an MCP
+ * client, gets one exactly when it did not ask for `openid`, since outside OIDC mode issuing one
+ * is at the server's discretion and some connectors never send a scope yet fail without one; any
+ * other client gets none. The `grant_types` a client registered play no part.
+ */
+export function shouldIssueRefreshToken(application: WorkOSConnectApplication, scopes: readonly string[]): boolean {
+  if (scopes.includes('offline_access')) return true;
+  if (application.was_dynamically_registered) return !scopes.includes('openid');
+  return false;
 }

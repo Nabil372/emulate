@@ -16,6 +16,7 @@ import {
   generateVerificationToken,
 } from '../helpers.js';
 import {
+  AUTHKIT_APPLICATION_TYPES,
   AUTHKIT_CODE_CHALLENGE_METHODS,
   AUTHKIT_OAUTH_SCOPES,
   AUTHKIT_TOKEN_ENDPOINT_AUTH_METHODS,
@@ -100,10 +101,16 @@ export function authkitOauthRoutes(ctx: RouteContext): void {
    * registration_types=dynamic` and is authorized, tokenized and revoked like any other.
    *
    * `token_endpoint_auth_method: none` makes a public client (PKCE-only, no secret); anything
-   * else a confidential one with a generated secret, `client_secret_basic` by default as RFC 7591
-   * §2 says. Scopes are limited to the standard set: a dynamically registered client cannot be
-   * given a custom scope. Errors are RFC 7591 §3.2.2's `invalid_redirect_uri` and
+   * else a confidential one with a generated secret. Omitted, it defaults as production defaults
+   * it: `none` for a `native` application (a public client, SEP-837), else `client_secret_basic`
+   * as RFC 7591 §2 says. `client_name` is required, as it is of production's registration DTO.
+   * Scopes are limited to the standard set: a dynamically registered client cannot be given a
+   * custom scope. Errors are RFC 7591 §3.2.2's `invalid_redirect_uri` and
    * `invalid_client_metadata`, not the API's `{message, code}`.
+   *
+   * The response carries production's field set: the resolved values of every field it defaults
+   * (`application_type`, `grant_types`, `response_types`, `token_endpoint_auth_method`), and
+   * `scope` only when the registration asked for one.
    */
   app.post('/oauth2/register', async (c: Context) => {
     let body: unknown;
@@ -136,7 +143,23 @@ export function authkitOauthRoutes(ctx: RouteContext): void {
       }
     }
 
-    const method = metadata.token_endpoint_auth_method ?? 'client_secret_basic';
+    if (typeof metadata.client_name !== 'string') {
+      throw new OauthApiError(400, 'invalid_client_metadata', 'client_name is required.');
+    }
+    const clientName = metadata.client_name;
+
+    // RFC 7591 §2: `web` unless the client says `native`.
+    const applicationType = metadata.application_type ?? 'web';
+    if (!(AUTHKIT_APPLICATION_TYPES as readonly unknown[]).includes(applicationType)) {
+      throw new OauthApiError(
+        400,
+        'invalid_client_metadata',
+        `application_type must be one of: ${AUTHKIT_APPLICATION_TYPES.join(', ')}.`,
+      );
+    }
+
+    const method =
+      metadata.token_endpoint_auth_method ?? (applicationType === 'native' ? 'none' : 'client_secret_basic');
     if (typeof method !== 'string' || !(AUTHKIT_TOKEN_ENDPOINT_AUTH_METHODS as readonly string[]).includes(method)) {
       throw new OauthApiError(
         400,
@@ -174,6 +197,8 @@ export function authkitOauthRoutes(ctx: RouteContext): void {
     }
 
     let scopes: string[] = [...AUTHKIT_OAUTH_SCOPES];
+    // Echoed only when asked for, as production echoes the scopes it could grant of those requested.
+    const scopeRequested = typeof metadata.scope === 'string' && metadata.scope.length > 0;
     if (metadata.scope !== undefined) {
       if (typeof metadata.scope !== 'string') {
         throw new OauthApiError(400, 'invalid_client_metadata', 'scope must be a space-delimited string.');
@@ -206,12 +231,10 @@ export function authkitOauthRoutes(ctx: RouteContext): void {
       }
     }
 
-    const clientName =
-      typeof metadata.client_name === 'string' && metadata.client_name.trim() ? metadata.client_name.trim() : null;
     const isPublic = method === 'none';
     const application = ws.connectApplications.insert({
       object: 'connect_application',
-      name: clientName ?? 'Dynamically registered application',
+      name: clientName,
       description: null,
       application_type: 'oauth',
       organization_id: null,
@@ -221,7 +244,9 @@ export function authkitOauthRoutes(ctx: RouteContext): void {
       is_first_party: false,
       was_dynamically_registered: true,
       uses_pkce: isPublic,
-      // Kept so /oauth2/token holds the client to what it registered for.
+      // Registered metadata, stored as production stores it. Neither is read at /oauth2/token: a
+      // refresh token is issued by the granted scopes (see shouldIssueRefreshToken), and a client
+      // may send its secret in the body or as Basic whichever method it registered.
       grant_types: grantTypes as string[],
       response_types: responseTypes as string[],
       token_endpoint_auth_method: method as (typeof AUTHKIT_TOKEN_ENDPOINT_AUTH_METHODS)[number],
@@ -249,13 +274,14 @@ export function authkitOauthRoutes(ctx: RouteContext): void {
       {
         client_id: application.client_id,
         client_id_issued_at: Math.floor(new Date(application.created_at).getTime() / 1000),
-        ...(clientSecret !== undefined ? { client_secret: clientSecret, client_secret_expires_at: 0 } : {}),
-        redirect_uris: application.redirect_uris,
+        application_type: applicationType,
         client_name: application.name,
-        token_endpoint_auth_method: method,
         grant_types: grantTypes,
+        redirect_uris: application.redirect_uris,
         response_types: responseTypes,
-        scope: scopes.join(' '),
+        token_endpoint_auth_method: method,
+        ...(scopeRequested ? { scope: scopes.join(' ') } : {}),
+        ...(clientSecret !== undefined ? { client_secret: clientSecret, client_secret_expires_at: 0 } : {}),
       },
       201,
     );

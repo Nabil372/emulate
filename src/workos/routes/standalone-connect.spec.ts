@@ -105,7 +105,7 @@ describe('Standalone Connect', () => {
     const tokenRes = await exchange(code);
     expect(tokenRes.status).toBe(200);
     const token = await json(tokenRes);
-    expect(token.token_type).toBe('Bearer');
+    expect(token.token_type).toBe('bearer');
     expect(token.expires_in).toBe(3600);
     expect(token.refresh_token).toBeUndefined();
     expect(token.id_token).toBeUndefined();
@@ -273,7 +273,7 @@ describe('Standalone Connect', () => {
       const query = new URLSearchParams({ client_id: 'unknown', ...params } as Record<string, string>);
       const res = await server.app.request(`/oauth2/authorize?${query}`);
       expect(res.status).toBe(302);
-      expect(res.headers.get('location')).toBe('http://localhost/oauth2/error?error=application_not_found');
+      expect(res.headers.get('location')).toBe(`${baseUrl}/oauth2/error?error=application_not_found`);
     });
   }
 

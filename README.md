@@ -568,12 +568,17 @@ single origin, so an MCP resource server can be tested against it locally:
    a client never follows discovery into a 404.
 2. **Registration.** `POST /oauth2/register` (RFC 7591), unauthenticated. It creates a real Connect
    `oauth` application: third-party, `was_dynamically_registered`, listed under
-   `registration_types=dynamic`. `token_endpoint_auth_method: none` makes a public client (PKCE
-   only, no secret); anything else, `client_secret_basic` by default, a confidential one with a
-   generated `client_secret`. The `grant_types` (default `["authorization_code"]`, as RFC 7591 says)
-   and `token_endpoint_auth_method` a client registers are stored and enforced at `/oauth2/token`:
-   no `refresh_token` grant type means no refresh token is issued and the grant is refused, and a
-   `client_secret_basic` client cannot send its secret in the body (nor the reverse). `logo_uri`,
+   `registration_types=dynamic`. `client_name` is required, as production requires it.
+   `token_endpoint_auth_method: none` makes a public client (PKCE only, no secret); anything else a
+   confidential one with a generated `client_secret`; omitted, it is `none` for
+   `application_type: native` and `client_secret_basic` otherwise, as in production. The
+   `grant_types` (default `["authorization_code"]`, as RFC 7591 says) and
+   `token_endpoint_auth_method` a client registers are stored and echoed, as production stores
+   them, but neither is enforced at `/oauth2/token`: production reads neither there, so a refresh
+   token is issued by the scope rule in step 4 and a confidential client may send its secret in the
+   body or as Basic either way. The response carries the resolved `application_type`,
+   `grant_types`, `response_types` and `token_endpoint_auth_method`, and `scope` only when the
+   registration asked for one. `logo_uri`,
    `client_uri`, `policy_uri` and `tos_uri` must be http(s) URLs. `redirect_uris` go through the [redirect-host policy](#redirect-uri-hosts);
    `scope` is limited to `openid profile email offline_access` (no custom scopes).
 3. **Authorize.** `GET /oauth2/authorize` on an application with no `login_url` validates the
@@ -591,30 +596,42 @@ single origin, so an MCP resource server can be tested against it locally:
    `login_url` keep the [Standalone Connect](#standalone-connect) behavior.
 4. **Token.** `POST /oauth2/token` with `authorization_code`: a public client authenticates by its
    `code_verifier` with no secret, a confidential one by its secret (post or Basic) and, if the
-   code carries a challenge, the verifier too. The response is `access_token`, `token_type`,
-   `expires_in`, `refresh_token` and `scope`. `grant_type=refresh_token` rotates the token within
-   the same session (the old one is spent) and can narrow, never widen, the scope. A request with no
+   code carries a challenge, the verifier too. The response is production's: `access_token`,
+   `token_type` (`bearer`, lowercase), `expires_in`, an `id_token` whatever the scope (production
+   mints one unconditionally), and `refresh_token` by production's rule: when the grant carries
+   `offline_access`, or when a dynamically registered client did not ask for `openid`; otherwise
+   none. There is no `scope` on a code exchange. `grant_type=refresh_token` rotates the token within
+   the same session (the old one is spent), can narrow, never widen, the scope, and answers with
+   `access_token`, `expires_in`, `id_token`, `refresh_token`, `scope` and `token_type`. A request with no
    client at all is `401 invalid_client` / `Missing authorization header.`; an unknown `client_id`
    is `401 invalid_client` / `Application not found.` under every grant type, checked before the
    grant type is validated; both carry `WWW-Authenticate: Basic realm="AuthKit"` (observed against
-   a production AuthKit domain, 2026-09-30). Token responses carry `Cache-Control: no-store` and
-   `Pragma: no-cache`. The `code_verifier` must be 43 to 128 unreserved characters (RFC 7636
-   §4.1), and a wrong one spends the code.
-   `client_credentials` keeps its behavior and claims, with one deliberate change to its client
-   errors: a request naming no client, or a `client_id` that does not exist, is now the `401` above
-   rather than the earlier `400 invalid_request` / `401 Invalid client ID or secret.`, and a known
-   client that presents no secret is `401 Missing authorization header.` (the last is an
-   assumption; only the unknown-client cases were observed).
+   a production AuthKit domain, 2026-09-30). The rest follows production's token-endpoint guards: a
+   confidential client that presents no secret is `401 Missing client_secret.`, a public client that
+   presents one `401 Unsupported client_secret.`, a wrong secret `401 Application not found.`, and a
+   public client asking for `client_credentials` `400 unauthorized_client`. Token responses carry
+   `Cache-Control: no-store` and `Pragma: no-cache`. The `code_verifier` must be 43 to 128
+   unreserved characters (RFC 7636 §4.1), and a wrong one spends the code.
+   `client_credentials` keeps its behavior and claims, with `token_type` now `bearer`, `scope`
+   omitted when none was issued, and its client errors the `401`s above rather than the earlier
+   `400 invalid_request` / `401 Invalid client ID or secret.`.
 5. **Claims.** Required of a Connect token: `iss` is the bare issuer, signed by the key at
    `/oauth2/jwks`, and it carries `aud`, `sub` (the user id), `client_id` and `exp`. Beyond that the
    set is an emulator choice, since production's full claim set was not captured: `sid`, `jti`, a
    space-delimited `scope`, `org_id` when the user has an organization context, and no `email`.
 6. **Resource indicators.** Declare the resource servers your environment registers, by seed or
-   through the API (`POST/GET /user_management/authkit_oauth_resources`, `DELETE …/:id`). When the
-   `resource` on authorize or token matches one, `aud` is that resource; otherwise `aud` falls back
-   to the application's `audience`, then its `client_id`. The resource is bound to the code and
-   carried across every refresh; the token request may restate it or omit it, and anything else
-   (including a resource on a grant authorized for none) is `invalid_target`.
+   through the API (`POST/GET /user_management/authkit_oauth_resources`, `DELETE …/:id`). The rules
+   are production's. At `/oauth2/authorize`, a dynamically registered client's `resource` is
+   validated once any resource is registered: a malformed value or one matching no registered
+   resource is `invalid_target` on the callback; with none registered the parameter is ignored. A
+   dynamically registered client bound to nothing (it named no `resource`, or none is registered)
+   is bound to the resource flagged `default`, when there is one. Other clients' `resource` is
+   ignored at authorize, as production ignores it without a feature flag. At `/oauth2/token`, a
+   bound grant may restate or omit its resource and nothing else; a grant bound to none may name a
+   registered resource and be bound to it, an unregistered one is `invalid_target`, and with no
+   resources registered the parameter is ignored. A bound resource is the token's `aud` and is
+   carried across every refresh; with none, `aud` falls back to the application's `audience`, then
+   its `client_id`.
 
 ```yaml
 resourceIndicators:
@@ -645,13 +662,13 @@ curl -s $BASE/oauth2/token -d grant_type=authorization_code -d client_id=$CLIENT
 curl -s $BASE/oauth2/token -d grant_type=refresh_token -d client_id=$CLIENT_ID -d refresh_token=ref_…
 ```
 
-**`id_token`.** When the granted scope includes `openid`, the code exchange response also carries
-an RS256 `id_token`, signed with the key at `/oauth2/jwks`: `iss` (the bare issuer), `sub`, `aud`
-(the `client_id`), `exp`, `iat`, `auth_time`, and `nonce` when the authorize request sent one.
-`email` and `email_verified` appear only with the `email` scope, and `name`, `given_name` and
-`family_name` only with `profile` and only when the user has a value. The refresh grant does not
-return an `id_token` (OIDC makes that optional). Which claims accompany the required ones, and the
-scope-to-claim mapping, are emulator choices: production's ID token was not captured.
+**`id_token`.** Every code exchange and every refresh carries an RS256 `id_token`, whatever the
+scope, because production mints one unconditionally. It is signed with the key at `/oauth2/jwks`:
+`iss` (the bare issuer), `sub`, `aud` (the `client_id`), `exp`, `iat`, `auth_time`, and `nonce`
+when the authorize request sent one (a refresh carries none). `email` and `email_verified` appear
+only with the `email` scope, and `name`, `given_name` and `family_name` only with `profile` and
+only when the user has a value. Which claims accompany the required ones, and the scope-to-claim
+mapping, are emulator choices: production's ID token was not captured.
 
 **Grant lifetime.** Each refresh re-checks the grant: it is refused with `invalid_grant` when the
 session has expired or been revoked, or when the organization the token was scoped to is no longer

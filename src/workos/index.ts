@@ -327,7 +327,10 @@ export interface WorkOSSeedConnectApplication {
    * belongs to, so `organization` is required for one. Defaults to `true`.
    */
   is_first_party?: boolean;
-  /** `oauth` only. Reported on the application; the emulator does not enforce PKCE from it. */
+  /**
+   * `oauth` only. Marks a public client: `/oauth2/authorize` requires a `code_challenge` of it,
+   * `/oauth2/token` redeems its codes by `code_verifier` alone and refuses it a client secret.
+   */
   uses_pkce?: boolean;
   /**
    * Emulator-only Standalone Connect login page, receiving an external_auth_id. Leave it out and

@@ -535,8 +535,9 @@ export interface WorkOSConnectApplication extends Entity {
   was_dynamically_registered: boolean;
   uses_pkce: boolean;
   /**
-   * oauth, dynamic registration only (RFC 7591): what the client registered for. Undefined on a
-   * seeded or dashboard-created application, which is not restricted on either.
+   * oauth, dynamic registration only (RFC 7591): the metadata the client registered, stored as
+   * production stores it and not enforced at `/oauth2/token`, where production reads neither.
+   * Undefined on a seeded or dashboard-created application.
    */
   grant_types?: string[];
   response_types?: string[];

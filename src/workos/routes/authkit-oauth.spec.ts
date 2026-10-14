@@ -126,11 +126,18 @@ describe('Dynamic client registration', () => {
     ws = getWorkOSStore(server.store);
   });
 
+  // A JSON object body is given the required `client_name` unless the test names one (or sets it
+  // to undefined, to leave it out).
   const register = (body: unknown, headers: Record<string, string> = { 'Content-Type': 'application/json' }) =>
     server.app.request('/oauth2/register', {
       method: 'POST',
       headers,
-      body: typeof body === 'string' ? body : JSON.stringify(body),
+      body:
+        typeof body === 'string'
+          ? body
+          : JSON.stringify(
+              body && typeof body === 'object' && !Array.isArray(body) ? { client_name: 'Test client', ...body } : body,
+            ),
     });
   const callback = 'http://localhost:33418/callback';
 
@@ -182,13 +189,65 @@ describe('Dynamic client registration', () => {
     expect(ws.clientSecrets.findBy('application_id', application.id).map((s) => s.value)).toEqual([body.client_secret]);
   });
 
-  it('defaults to client_secret_basic, as RFC 7591 §2 does', async () => {
+  it('defaults as production does: web, client_secret_basic, authorization_code, code, and no scope echoed', async () => {
     const body = await json(await register({ redirect_uris: [callback] }));
+    expect(body.application_type).toBe('web');
     expect(body.token_endpoint_auth_method).toBe('client_secret_basic');
     expect(body.client_secret).toMatch(/^secret_/);
     expect(body.grant_types).toEqual(['authorization_code']);
-    // No scope asked for: the whole standard set.
-    expect(body.scope).toBe('email offline_access openid profile');
+    expect(body.response_types).toEqual(['code']);
+    // No scope asked for: none echoed, though the whole standard set is available to the client.
+    expect(body).not.toHaveProperty('scope');
+    expect(ws.connectApplications.findOneBy('client_id', body.client_id)!.scopes).toEqual([
+      'email',
+      'offline_access',
+      'openid',
+      'profile',
+    ]);
+    expect(Object.keys(body).sort()).toEqual([
+      'application_type',
+      'client_id',
+      'client_id_issued_at',
+      'client_name',
+      'client_secret',
+      'client_secret_expires_at',
+      'grant_types',
+      'redirect_uris',
+      'response_types',
+      'token_endpoint_auth_method',
+    ]);
+  });
+
+  it('requires client_name, as production does', async () => {
+    for (const client_name of [undefined, 42, null]) {
+      const res = await register({ redirect_uris: [callback], client_name });
+      expect(res.status).toBe(400);
+      expect(await json(res)).toEqual({
+        error: 'invalid_client_metadata',
+        error_description: 'client_name is required.',
+      });
+    }
+    expect(ws.connectApplications.all()).toHaveLength(0);
+  });
+
+  it('defaults a native application to a public client, and echoes application_type', async () => {
+    const native = await json(await register({ redirect_uris: [callback], application_type: 'native' }));
+    expect(native.application_type).toBe('native');
+    expect(native.token_endpoint_auth_method).toBe('none');
+    expect(native).not.toHaveProperty('client_secret');
+    expect(ws.connectApplications.findOneBy('client_id', native.client_id)!.uses_pkce).toBe(true);
+    // An explicit method still wins.
+    const confidential = await json(
+      await register({
+        redirect_uris: [callback],
+        application_type: 'native',
+        token_endpoint_auth_method: 'client_secret_post',
+      }),
+    );
+    expect(confidential.token_endpoint_auth_method).toBe('client_secret_post');
+    const bad = await register({ redirect_uris: [callback], application_type: 'desktop' });
+    expect(bad.status).toBe(400);
+    expect((await json(bad)).error).toBe('invalid_client_metadata');
   });
 
   it('shows dynamically registered applications only under registration_types=dynamic', async () => {

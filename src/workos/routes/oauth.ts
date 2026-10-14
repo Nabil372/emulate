@@ -16,6 +16,8 @@ import {
   isValidResourceUri,
   pkceMatches,
   resolveAudience,
+  resolveAuthorizeResource,
+  shouldIssueRefreshToken,
 } from '../authkit-oauth.js';
 import { createConnectAuthorizeRequest } from '../connect-authorize-request.js';
 import { STORE_KEYS } from '../constants.js';
@@ -61,7 +63,10 @@ import type { WorkOSConnectApplication, WorkOSSession, WorkOSUser } from '../ent
  * domain, 2026-09-30: `401 invalid_client` with `WWW-Authenticate: Basic realm="AuthKit"`, "Missing
  * authorization header." when no client is named and "Application not found." for an unknown
  * `client_id` under every grant type, with the client lookup running before grant-type validation.
- * That deliberately replaces this endpoint's earlier 400s for a missing or unknown client.
+ * That deliberately replaces this endpoint's earlier 400s for a missing or unknown client. The rest
+ * of client authentication mirrors production's token-endpoint guards: a client is only ever public
+ * or confidential, and either kind may send its credentials in the body or as HTTP Basic, whatever
+ * `token_endpoint_auth_method` it registered.
  */
 
 const TOKEN_TTL_SECONDS = 3600;
@@ -70,8 +75,6 @@ interface TokenParams {
   grantType?: string;
   clientId?: string;
   clientSecret?: string;
-  /** Where the secret came from, since a registered client may be limited to one of the two. */
-  secretVia?: 'basic' | 'post';
   scope?: string;
   code?: string;
   redirectUri?: string;
@@ -121,7 +124,6 @@ async function readTokenParams(c: Context): Promise<TokenParams> {
 
   let clientId = str(raw.client_id);
   let clientSecret = str(raw.client_secret);
-  let secretVia: 'basic' | 'post' | undefined = clientSecret ? 'post' : undefined;
 
   const authHeader = c.req.header('authorization');
   if ((!clientId || !clientSecret) && authHeader && /^basic\s/i.test(authHeader)) {
@@ -129,10 +131,7 @@ async function readTokenParams(c: Context): Promise<TokenParams> {
     const sep = decoded.indexOf(':');
     if (sep >= 0) {
       clientId = clientId || formDecode(decoded.slice(0, sep));
-      if (!clientSecret) {
-        clientSecret = formDecode(decoded.slice(sep + 1));
-        secretVia = 'basic';
-      }
+      clientSecret = clientSecret || formDecode(decoded.slice(sep + 1));
     }
   }
 
@@ -140,7 +139,6 @@ async function readTokenParams(c: Context): Promise<TokenParams> {
     grantType: str(raw.grant_type),
     clientId,
     clientSecret,
-    secretVia,
     scope: str(raw.scope),
     code: str(raw.code),
     redirectUri: str(raw.redirect_uri),
@@ -186,7 +184,8 @@ export function oauthRoutes(ctx: RouteContext): void {
     // An unknown client is a redirect to the error page, not an API error (observed against a
     // production AuthKit domain, 2026-09-30): the caller is a browser with no callback to trust yet.
     if (!application) {
-      return c.redirect(`${new URL(c.req.url).origin}/oauth2/error?error=application_not_found`, 302);
+      // Built from baseUrl, like every other link the emulator mints, not from the request origin.
+      return c.redirect(`${ctx.baseUrl}/oauth2/error?error=application_not_found`, 302);
     }
     if (!redirectUri) {
       throw new OauthApiError(400, 'invalid_request', 'client_id and redirect_uri are required.');
@@ -227,6 +226,11 @@ export function oauthRoutes(ctx: RouteContext): void {
     // public client, whose challenge is the only thing that later proves the code is its own.
     const codeChallenge = c.req.query('code_challenge');
     const codeChallengeMethod = c.req.query('code_challenge_method');
+    // Production refuses a challenge with no method rather than assuming S256 (its
+    // `missing_code_challenge_method`, reported as `invalid_request`, with this description).
+    if (codeChallenge !== undefined && codeChallengeMethod === undefined) {
+      return fail('invalid_request', 'code_challenge_method is required when code_challenge is provided.');
+    }
     if (codeChallengeMethod !== undefined && codeChallengeMethod !== 'S256') {
       return fail('invalid_request', 'code_challenge_method must be S256.');
     }
@@ -256,11 +260,16 @@ export function oauthRoutes(ctx: RouteContext): void {
       );
     }
 
-    // RFC 8707. Any well-formed resource is accepted here, registered or not; whether it becomes
-    // the token's `aud` is decided when a token is minted (see resolveAudience).
-    const resource = c.req.query('resource') ?? null;
-    if (resource !== null && !isValidResourceUri(resource)) {
-      return fail('invalid_target', 'resource must be an absolute URI without a fragment.');
+    // RFC 8707. Validated against the environment's registered resources, and defaulted, the way
+    // production does it; see resolveAuthorizeResource. What is stored is what the grant is bound
+    // to, and what its tokens carry as `aud`.
+    const resource = resolveAuthorizeResource(ws, application, c.req.query('resource') ?? null);
+    if (!resource.ok) {
+      const redirect = new URL(redirectUri);
+      redirect.searchParams.set('error', 'invalid_target');
+      if (resource.description !== undefined) redirect.searchParams.set('error_description', resource.description);
+      if (state !== undefined) redirect.searchParams.set('state', state);
+      return c.redirect(redirect.toString(), 302);
     }
 
     const requestId = createConnectAuthorizeRequest(store, {
@@ -270,11 +279,11 @@ export function oauthRoutes(ctx: RouteContext): void {
       code_challenge: codeChallenge ?? null,
       code_challenge_method: codeChallenge === undefined ? null : 'S256',
       scope: scopes,
-      resource,
+      resource: resource.resource,
       nonce: c.req.query('nonce') ?? null,
     });
 
-    const signIn = new URL(`${new URL(c.req.url).origin}/user_management/authorize`);
+    const signIn = new URL(`${ctx.baseUrl}/user_management/authorize`);
     signIn.searchParams.set('connect_request', requestId);
     // The two hints the sign-in page understands; neither widens what the request was validated for.
     for (const hint of ['login_hint', 'organization_id']) {
@@ -332,19 +341,19 @@ export function oauthRoutes(ctx: RouteContext): void {
   const cappedAt = (a: string, b: string) => (a < b ? a : b);
 
   /**
-   * The token response for a user signed in through the hosted page: a Connect access token and a
-   * refresh token. Known requirements of a Connect token: `iss` is the bare AuthKit domain, and it
-   * carries `aud`, `sub` (the user id), `client_id` and `exp`. The rest of the claim set (`sid`,
-   * `jti`, `org_id`, a space-delimited `scope`, and the absence of email, role, permissions and
-   * JWT-template claims) is an emulator choice: production's full set was not captured.
+   * The Connect access token for a user signed in through the hosted page. Known requirements of a
+   * Connect token: `iss` is the bare AuthKit domain, and it carries `aud`, `sub` (the user id),
+   * `client_id` and `exp`. The rest of the claim set (`sid`, `jti`, `org_id`, a space-delimited
+   * `scope`, and the absence of email, role, permissions and JWT-template claims) is an emulator
+   * choice: production's full set was not captured.
    */
-  const issueUserTokens = (
+  const mintAccessToken = (
     application: WorkOSConnectApplication,
     session: WorkOSSession,
     scope: string[],
     resource: string | null,
-  ) => {
-    const accessToken = jwt.sign(
+  ): string =>
+    jwt.sign(
       {
         sub: session.user_id,
         sid: session.id,
@@ -352,32 +361,28 @@ export function oauthRoutes(ctx: RouteContext): void {
         org_id: session.organization_id ?? undefined,
         client_id: application.client_id,
         scope: scope.join(' '),
-        aud: resolveAudience(ws, application, resource),
+        aud: resolveAudience(application, resource),
       },
       { expiresIn: TOKEN_TTL_SECONDS },
     );
-    const body: Record<string, unknown> = {
-      access_token: accessToken,
-      token_type: 'Bearer',
-      expires_in: TOKEN_TTL_SECONDS,
-      scope: scope.join(' '),
-    };
-    // A client registered without the refresh_token grant is not given one. The resource and scope
-    // ride on the token so they survive every rotation.
-    if (!application.grant_types || application.grant_types.includes('refresh_token')) {
-      body.refresh_token = ws.refreshTokens.insert({
-        token: generateId('ref'),
-        user_id: session.user_id,
-        organization_id: session.organization_id,
-        session_id: session.id,
-        // Never outlives the session it belongs to, so rotation cannot extend a sign-in.
-        expires_at: cappedAt(expiresIn(30 * 24 * 60), session.expires_at),
-        client_id: application.client_id,
-        connect: { scope, resource },
-      }).token;
-    }
-    return body;
-  };
+
+  /** A refresh token on the session. The resource and scope ride on it so they survive every rotation. */
+  const mintRefreshToken = (
+    application: WorkOSConnectApplication,
+    session: WorkOSSession,
+    scope: string[],
+    resource: string | null,
+  ): string =>
+    ws.refreshTokens.insert({
+      token: generateId('ref'),
+      user_id: session.user_id,
+      organization_id: session.organization_id,
+      session_id: session.id,
+      // Never outlives the session it belongs to, so rotation cannot extend a sign-in.
+      expires_at: cappedAt(expiresIn(30 * 24 * 60), session.expires_at),
+      client_id: application.client_id,
+      connect: { scope, resource },
+    }).token;
 
   /**
    * The grant's stored scopes that the application can still issue. A scope removed from the
@@ -395,11 +400,13 @@ export function oauthRoutes(ctx: RouteContext): void {
   };
 
   /**
-   * An OIDC `id_token` for the code exchange, RS256 under the key at `/oauth2/jwks`. `iss` is the
-   * bare issuer and `aud` the client_id, as OIDC Core §2 requires. Which claims ride along is an
-   * emulator choice, following the OIDC scope rules (Core §5.4): `email` and `email_verified` only
-   * with the `email` scope, and `name`/`given_name`/`family_name` only with `profile` and only where
-   * the user has a value. `nonce` is echoed when the authorize request carried one.
+   * The `id_token` production mints with every code exchange and every refresh, whatever the scope
+   * (its token service mints one unconditionally; only the claims inside follow the scopes). RS256
+   * under the key at `/oauth2/jwks`; `iss` is the bare issuer and `aud` the client_id, as OIDC Core
+   * §2 requires. Which claims ride along is an emulator choice, following the OIDC scope rules
+   * (Core §5.4): `email` and `email_verified` only with the `email` scope, and
+   * `name`/`given_name`/`family_name` only with `profile` and only where the user has a value.
+   * `nonce` is echoed when the authorize request carried one; a refresh carries none.
    */
   const issueIdToken = (
     application: WorkOSConnectApplication,
@@ -445,37 +452,40 @@ export function oauthRoutes(ctx: RouteContext): void {
   };
 
   /**
-   * RFC 8707 §2.2 on the token request: the grant is bound to the resource it was authorized for, so
-   * the request may restate that resource or omit it. Anything else is `invalid_target`, including a
-   * resource named for a grant that was authorized for none: a grant cannot pick one up later.
+   * RFC 8707 `resource` on the token request, resolved as production's resource locator does it
+   * (`forRequestedResource`). A grant bound to a resource stays bound to it: the request may
+   * restate or omit it, anything else is `invalid_target`, and so is a bound resource that has since
+   * been deleted. A grant bound to none may name a registered resource here and be bound to it; an
+   * unregistered or malformed one is `invalid_target`, unless the environment has registered no
+   * resources at all, in which case the parameter is ignored for backwards compatibility.
    */
   const bindResource = (bound: string | null, requested: string | undefined): string | null => {
-    if (requested === undefined) return bound;
+    const invalidTarget = (message: string) => new OauthApiError(400, 'invalid_target', message);
+    if (bound !== null) {
+      if (!ws.authkitOauthResources.findOneBy('uri', bound)) {
+        throw invalidTarget('The resource the grant was issued for is no longer registered.');
+      }
+      if (requested === undefined) return bound;
+      if (!isValidResourceUri(requested) || requested !== bound) {
+        throw invalidTarget('resource does not match the resource the grant was issued for.');
+      }
+      return bound;
+    }
+    if (requested === undefined || ws.authkitOauthResources.all().length === 0) return null;
     if (!isValidResourceUri(requested)) {
-      throw new OauthApiError(400, 'invalid_target', 'resource must be an absolute URI without a fragment.');
+      throw invalidTarget('resource must be an absolute URI without a fragment.');
     }
-    if (requested !== bound) {
-      throw new OauthApiError(400, 'invalid_target', 'resource does not match the resource the grant was issued for.');
-    }
-    return bound;
+    const match = ws.authkitOauthResources.findOneBy('uri', requested);
+    if (!match) throw invalidTarget('resource is not registered for this environment.');
+    return match.uri;
   };
 
   const invalidClient = (description: string) =>
     new OauthApiError(401, 'invalid_client', description, { 'WWW-Authenticate': 'Basic realm="AuthKit"' });
 
   app.post('/oauth2/token', async (c) => {
-    const {
-      grantType,
-      clientId,
-      clientSecret,
-      secretVia,
-      scope,
-      code,
-      redirectUri,
-      codeVerifier,
-      refreshToken,
-      resource,
-    } = await readTokenParams(c);
+    const { grantType, clientId, clientSecret, scope, code, redirectUri, codeVerifier, refreshToken, resource } =
+      await readTokenParams(c);
 
     // Client first, grant type second: an unknown client is refused the same way whatever grant it
     // names, including an unsupported one (observed against a production AuthKit domain, 2026-09-30).
@@ -491,26 +501,26 @@ export function oauthRoutes(ctx: RouteContext): void {
       );
     }
 
-    const matchedSecret = clientSecret
-      ? ws.clientSecrets.findBy('application_id', application.id).find((s) => s.value === clientSecret)
-      : undefined;
-    if (clientSecret && !matchedSecret) throw invalidClient('Invalid client ID or secret.');
-    // A dynamically registered client authenticates the way it registered to: none, Basic or in
-    // the body. An admin-added secret does not turn a public registration into a confidential one.
-    // Seeded applications registered for nothing, so they accept both secret methods.
-    const registeredMethod = application.token_endpoint_auth_method;
-    if (
-      matchedSecret &&
-      (registeredMethod === 'none' ||
-        (registeredMethod === 'client_secret_basic' && secretVia !== 'basic') ||
-        (registeredMethod === 'client_secret_post' && secretVia !== 'post'))
-    ) {
-      throw invalidClient(`This client is registered for ${registeredMethod}.`);
-    }
-    // A public client authenticates by its PKCE verifier, so for the two grants a user sign-in
-    // produces it may present no secret at all. One that does present a secret is held to it.
-    if (!clientSecret && !(grantType !== 'client_credentials' && isPublicClient(application))) {
-      throw invalidClient('Missing authorization header.');
+    // Production's two token-endpoint guards, which know a client only as public or confidential
+    // and accept its credentials from the body or the Basic header alike. With a secret: the
+    // client_id/secret pair must exist, and a public client may not present one at all (an
+    // admin-added secret does not turn a public registration into a confidential one). Without
+    // one: a confidential client is refused, and a public client, which proves itself by PKCE,
+    // may use only the grants a user sign-in produces.
+    let matchedSecret: { id: string } | undefined;
+    if (clientSecret) {
+      matchedSecret = ws.clientSecrets.findBy('application_id', application.id).find((s) => s.value === clientSecret);
+      if (!matchedSecret) throw invalidClient('Application not found.');
+      if (isPublicClient(application)) throw invalidClient('Unsupported client_secret.');
+    } else {
+      if (!isPublicClient(application)) throw invalidClient('Missing client_secret.');
+      if (grantType === 'client_credentials') {
+        throw new OauthApiError(
+          400,
+          'unauthorized_client',
+          'Public clients are not authorized to use this grant type.',
+        );
+      }
     }
     const expectedType = grantType === 'client_credentials' ? 'm2m' : 'oauth';
     if (application.application_type !== expectedType) {
@@ -518,14 +528,6 @@ export function oauthRoutes(ctx: RouteContext): void {
         400,
         'unauthorized_client',
         `The client is not authorized to use the ${grantType} grant type.`,
-      );
-    }
-
-    if (grantType !== 'client_credentials' && application.grant_types && !application.grant_types.includes(grantType)) {
-      throw new OauthApiError(
-        400,
-        'unauthorized_client',
-        `The client is not registered for the ${grantType} grant type.`,
       );
     }
 
@@ -562,8 +564,17 @@ export function oauthRoutes(ctx: RouteContext): void {
       const granted = narrowScope(currentGrant(application, stored.connect.scope), scope);
       const bound = bindResource(stored.connect.resource, resource);
       ws.refreshTokens.delete(stored.id);
-      // The narrowed scope and the bound resource carry forward; a narrowing is not undone by the next refresh.
-      response = issueUserTokens(application, session, granted, bound);
+      // The field set production's refresh grant answers with: a rotated refresh token on every
+      // refresh, an `id_token`, and the issued `scope`. The narrowed scope and the bound resource
+      // carry forward; a narrowing is not undone by the next refresh.
+      response = {
+        access_token: mintAccessToken(application, session, granted, bound),
+        expires_in: TOKEN_TTL_SECONDS,
+        id_token: issueIdToken(application, ws.users.get(stored.user_id)!, session, granted, null),
+        refresh_token: mintRefreshToken(application, session, granted, bound),
+        scope: granted.join(' '),
+        token_type: 'bearer',
+      };
     } else if (grantType === 'authorization_code') {
       if (!code || !redirectUri) {
         throw new OauthApiError(400, 'invalid_request', 'code and redirect_uri are required.');
@@ -620,11 +631,17 @@ export function oauthRoutes(ctx: RouteContext): void {
 
         ws.authCodes.delete(authCode.id);
         const session = startSession(c, user, organizationId, authCode);
-        response = issueUserTokens(application, session, granted, bound);
-        // OIDC Core §3.1.3.3: the code exchange returns the ID token. Refresh does not, which OIDC
-        // allows (§12.2 makes it optional) and which keeps refresh a plain access-token rotation.
-        if (granted.includes('openid')) {
-          response.id_token = issueIdToken(application, user, session, granted, authCode.connect.nonce ?? null);
+        // The field set production's authorization_code grant answers with: no `scope`, an
+        // `id_token` whatever was granted, and a refresh token only by the rule in
+        // shouldIssueRefreshToken, judged on the scopes the grant was authorized for.
+        response = {
+          access_token: mintAccessToken(application, session, granted, bound),
+          expires_in: TOKEN_TTL_SECONDS,
+          id_token: issueIdToken(application, user, session, granted, authCode.connect.nonce ?? null),
+          token_type: 'bearer',
+        };
+        if (shouldIssueRefreshToken(application, authCode.connect.scope)) {
+          response.refresh_token = mintRefreshToken(application, session, granted, bound);
         }
       } else {
         // Minimal Standalone Connect exchange: no refresh token, id_token, or PKCE.
@@ -640,7 +657,7 @@ export function oauthRoutes(ctx: RouteContext): void {
             },
             { expiresIn: TOKEN_TTL_SECONDS },
           ),
-          token_type: 'Bearer',
+          token_type: 'bearer',
           expires_in: TOKEN_TTL_SECONDS,
           scope: granted.join(' '),
         };
@@ -657,6 +674,7 @@ export function oauthRoutes(ctx: RouteContext): void {
       // Both the audience and tenant come from the stored application, never the caller,
       // so a client can't mint a token for an arbitrary aud or an org it isn't tied to.
       // aud defaults to the client_id; pin `audience` on the app to match production.
+      // Production's client_credentials grant leaves `scope` off the response when none was issued.
       response = {
         access_token: jwt.sign(
           {
@@ -668,9 +686,9 @@ export function oauthRoutes(ctx: RouteContext): void {
           },
           { expiresIn: TOKEN_TTL_SECONDS },
         ),
-        token_type: 'Bearer',
         expires_in: TOKEN_TTL_SECONDS,
-        scope: granted.join(' '),
+        token_type: 'bearer',
+        ...(granted.length > 0 ? { scope: granted.join(' ') } : {}),
       };
     }
 
