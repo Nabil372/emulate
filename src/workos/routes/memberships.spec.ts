@@ -100,6 +100,57 @@ describe('Membership routes', () => {
     expect(res.status).toBe(409);
   });
 
+  describe('create over an inactive membership', () => {
+    async function seedInactive() {
+      const org = await createOrg('Rejoin Org');
+      const user = await createUser('rejoin@test.com');
+      const m = await json(
+        await req('/user_management/organization_memberships', {
+          method: 'POST',
+          body: JSON.stringify({ organization_id: org.id, user_id: user.id }),
+        }),
+      );
+      await req(`/user_management/organization_memberships/${m.id}/deactivate`, { method: 'PUT' });
+      return { orgId: org.id as string, userId: user.id as string, membershipId: m.id as string };
+    }
+
+    it('reactivates the existing membership with the requested role', async () => {
+      const { orgId, userId, membershipId } = await seedInactive();
+
+      const res = await req('/user_management/organization_memberships', {
+        method: 'POST',
+        body: JSON.stringify({ organization_id: orgId, user_id: userId, role_slug: 'admin' }),
+      });
+      expect(res.status).toBe(201);
+      const m = await json(res);
+      expect({ id: m.id, status: m.status, role: m.role.slug }).toEqual({
+        id: membershipId,
+        status: 'active',
+        role: 'admin',
+      });
+
+      const list = await json(
+        await req(`/user_management/organization_memberships?organization_id=${orgId}&statuses=active,inactive`),
+      );
+      expect(list.data.map((x: { id: string; status: string }) => [x.id, x.status])).toEqual([
+        [membershipId, 'active'],
+      ]);
+    });
+
+    it('rejects a second create once the membership is active again', async () => {
+      const { orgId, userId, membershipId } = await seedInactive();
+      const body = JSON.stringify({ organization_id: orgId, user_id: userId });
+
+      expect((await req('/user_management/organization_memberships', { method: 'POST', body })).status).toBe(201);
+      expect((await req('/user_management/organization_memberships', { method: 'POST', body })).status).toBe(409);
+
+      const list = await json(
+        await req(`/user_management/organization_memberships?organization_id=${orgId}&statuses=active,inactive`),
+      );
+      expect(list.data.map((x: { id: string }) => x.id)).toEqual([membershipId]);
+    });
+  });
+
   it('lists memberships filtered by org', async () => {
     const org = await createOrg('List Org');
     const u1 = await createUser('m1@test.com');

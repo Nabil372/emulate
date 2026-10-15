@@ -37,12 +37,23 @@ export function membershipRoutes(ctx: RouteContext): void {
 
     const existing = ws.organizationMemberships
       .findBy('organization_id', organizationId)
-      .find((m) => m.user_id === userId && m.status !== 'inactive');
-    if (existing) {
+      .filter((m) => m.user_id === userId);
+    if (existing.some((m) => m.status !== 'inactive')) {
       throw new WorkOSApiError(409, 'Membership already exists', 'conflict');
     }
 
     const roleSlug = (body.role_slug as string) ?? 'member';
+
+    // Production activates a matching inactive membership "with the specified role(s)" rather
+    // than adding a second one. PUT .../reactivate is the variant that keeps the old role.
+    const inactive = existing[0];
+    if (inactive) {
+      const reactivated = ws.organizationMemberships.update(inactive.id, {
+        status: 'active',
+        role: { slug: roleSlug },
+      });
+      return c.json(formatMembership(reactivated!, ws), 201);
+    }
 
     const membership = ws.organizationMemberships.insert({
       object: 'organization_membership',
